@@ -1,0 +1,305 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: >
+  A static website hosted on S3 with a class 200 CloudFront CDN and an
+  authoritative DNS zone in Route 53. (Requires a valid ACM certificate.)
+
+Parameters:
+
+  DomainName:
+    Type: String
+    Description: The domain name of the website (not starting with a 'www' label)
+    AllowedPattern: ^(?!www\.)(([a-z0-9][-a-z0-9]*)?[a-z0-9]\.)*([a-z0-9][-a-z0-9]*)?[a-z0-9]\.(xn--)?[a-z]{2,}$
+    ConstraintDescription: Valid internet domain name that does not start with 'www.'
+
+  UseWww:
+    Type: String
+    Description: Use 'www' as the website's hostname, as a redirect to the domain name, or not at all
+    AllowedValues: [HostName, Redirect]
+    ConstraintDescription: One of 'HostName' or 'Redirect'
+
+  OriginRequestLambdaArn:
+    Type: String
+    Description: A lambda function in the US East (N. Virginia) region (use the rewrite directory to index lambda, or leave empty)
+    AllowedPattern: ^|arn:aws:lambda:us-east-1:\d+:function:[a-zA-Z0-9-]+:\d+$
+    ConstraintDescription: A lambda version ARN or empty
+
+  AcmCertificateArn:
+    Type: String
+    Description: A validated ACM certificate in the US East (N. Virginia) region (or leave empty)
+    AllowedPattern: ^|arn:aws:acm:us-east-1:\d+:certificate/[a-f0-9]{8,8}-[a-f0-9]{4,4}-[a-f0-9]{4,4}-[a-f0-9]{4,4}-[a-f0-9]{12,12}$
+    ConstraintDescription: An ACM certificate ARN or empty
+
+  ErrorDocument:
+    Type: String
+    Description: The absolute path to an error document that should be returned by CloudFront when S3 returns an error.
+    AllowedPattern: ^|/[a-zA-Z0-9-_.]+$
+    ConstraintDescription: Valid file path
+
+Conditions:
+
+  WwwAsHostName: !Equals [!Ref UseWww, HostName]
+  RequiresRedirect: !Not [!Equals [!Ref UseWww, '']]
+  UseOriginRequestLambda: !Not [!Equals [!Ref OriginRequestLambdaArn, '']]
+  UseAcmCertificate: !Not [!Equals [!Ref AcmCertificateArn, '']]
+  UseErrorDocument: !Not [!Equals [!Ref ErrorDocument, '']]
+
+Resources:
+
+  DNSZone:
+    # The authoritative DNS zone for example.com
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref DomainName
+
+  DomainNameARecord:
+    # A record for example.com
+    Type: AWS::Route53::RecordSet
+    DependsOn: DNSZone
+    Properties:
+      HostedZoneId: !Ref DNSZone
+      Type: A
+      Name: !Ref DomainName
+      AliasTarget:
+        DNSName: !If
+          - WwwAsHostName
+          - !GetAtt RedirectCDN.DomainName
+          - !GetAtt ContentCDN.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  WwwARecord:
+    # A record for www.example.com
+    Type: AWS::Route53::RecordSet
+    Condition: RequiresRedirect
+    DependsOn: DNSZone
+    Properties:
+      HostedZoneId: !Ref DNSZone
+      Type: A
+      Name: !Sub www.${DomainName}
+      AliasTarget:
+        DNSName: !If
+          - WwwAsHostName
+          - !GetAtt ContentCDN.DomainName
+          - !GetAtt RedirectCDN.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  LogsBucket:
+    # Used by S3 and CloudFront
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join ['-', [!Join ['-', !Split ['.', !Ref DomainName]], logs]] # example-com-logs
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      AccessControl: LogDeliveryWrite # CloudFront adds an ACL for the awslogsdelivery account
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ContentBucket:
+    # Hosts the static assets of the website
+    Type: AWS::S3::Bucket
+    DependsOn: LogsBucket
+    Properties:
+      BucketName: !Join ['-', !Split ['.', !Ref DomainName]] # example-com
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogsBucket
+        LogFilePrefix: s3/website/
+
+  ContentBucketPolicy:
+    # Grant read access to the origin access identity only
+    Type: AWS::S3::BucketPolicy
+    DependsOn: ContentBucket
+    Properties:
+      Bucket: !Ref ContentBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${OriginAccessIdentity}
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${ContentBucket}/*
+
+  ContentDeploymentUser:
+    # Deploys the static assets of the website
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub ${AWS::StackName}-ContentDeploymentUser
+      Policies:
+        - PolicyName: Default
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt ContentBucket.Arn
+                  - !Sub ${ContentBucket.Arn}/*
+
+  OriginAccessIdentity:
+    # Requests the static assets of the website
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub ${ContentBucket}
+
+  ContentCDN:
+    # Serves the static assets of the website
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        PriceClass: PriceClass_200
+        HttpVersion: http2
+        DefaultRootObject: index.html
+        Aliases: !If
+          - UseAcmCertificate
+          - !If
+            - WwwAsHostName
+            - - !Sub www.${DomainName}
+            - - !Ref DomainName
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - UseAcmCertificate
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.1_2016
+          - !Ref AWS::NoValue
+        Logging:
+          Bucket: !GetAtt LogsBucket.DomainName
+          Prefix: cloudfront/website/
+          IncludeCookies: true
+        Origins:
+          - Id: default
+            DomainName: !GetAtt ContentBucket.DomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub origin-access-identity/cloudfront/${OriginAccessIdentity}
+        DefaultCacheBehavior:
+          TargetOriginId: default
+          ForwardedValues:
+            Cookies:
+              Forward: none
+            QueryString: false
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          LambdaFunctionAssociations: !If
+            - UseOriginRequestLambda
+            - - EventType: origin-request # Execute only when CloudFront forwards a request
+                LambdaFunctionARN: !Ref OriginRequestLambdaArn
+            - !Ref AWS::NoValue
+        CustomErrorResponses: !If
+          - UseErrorDocument
+          - - ErrorCode: 400 # Bad Request
+              ResponseCode: 400
+              ResponsePagePath: !Ref ErrorDocument
+            - ErrorCode: 403 # Forbidden
+              ResponseCode: 403
+              ResponsePagePath: !Ref ErrorDocument
+            - ErrorCode: 404 # Not Found
+              ResponseCode: 404
+              ResponsePagePath: !Ref ErrorDocument
+            - ErrorCode: 405 # Method Not Allowed
+              ResponseCode: 405
+              ResponsePagePath: !Ref ErrorDocument
+            - ErrorCode: 414 # Request-URI Too Long
+              ResponseCode: 414
+              ResponsePagePath: !Ref ErrorDocument
+            - ErrorCode: 416 # Request Range Not Satisfiable
+              ResponseCode: 416
+              ResponsePagePath: !Ref ErrorDocument
+            - ErrorCode: 500 # Internal Server Error
+              ResponseCode: 500
+              ResponsePagePath: !Ref ErrorDocument
+            - ErrorCode: 501 # Not Implemented
+              ResponseCode: 501
+              ResponsePagePath: !Ref ErrorDocument
+            - ErrorCode: 502 # Bad Gateway
+              ResponseCode: 502
+              ResponsePagePath: !Ref ErrorDocument
+            - ErrorCode: 503 # Service Unavailable
+              ResponseCode: 503
+              ResponsePagePath: !Ref ErrorDocument
+            - ErrorCode: 504 # Gateway Timeout
+              ResponseCode: 504
+              ResponsePagePath: !Ref ErrorDocument
+          - !Ref AWS::NoValue
+
+  RedirectBucket:
+    # Optional bucket configured to redirect to example.com or www.example.com
+    Type: AWS::S3::Bucket
+    Condition: RequiresRedirect
+    DependsOn: LogsBucket
+    Properties:
+      BucketName: !Join ['-', [!Join ['-', !Split ['.', !Ref DomainName]], redirect]] # example-com-redirect
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      WebsiteConfiguration:
+        RedirectAllRequestsTo:
+          Protocol: https
+          HostName: !If
+            - UseAcmCertificate
+            - !If
+              - WwwAsHostName
+              - !Sub www.${DomainName}
+              - !Ref DomainName
+            - !GetAtt ContentCDN.DomainName
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogsBucket
+        LogFilePrefix: s3/redirect/
+
+  RedirectCDN:
+    # Optional CloudFront distribution for the redirect bucket
+    Type: AWS::CloudFront::Distribution
+    Condition: RequiresRedirect
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        PriceClass: PriceClass_200
+        HttpVersion: http2
+        Aliases: !If
+          - UseAcmCertificate
+          - !If
+            - WwwAsHostName
+            - - !Ref DomainName
+            - - !Sub www.${DomainName}
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - UseAcmCertificate
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.1_2016
+          - !Ref AWS::NoValue
+        Origins:
+          - Id: default
+            DomainName: !Select [1, !Split ['://', !GetAtt RedirectBucket.WebsiteURL]]
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: default
+          ForwardedValues:
+            Cookies:
+              Forward: none
+            QueryString: false
+          ViewerProtocolPolicy: allow-all
+        Logging:
+          Bucket: !GetAtt LogsBucket.DomainName
+          Prefix: cloudfront/redirect/
+          IncludeCookies: true
