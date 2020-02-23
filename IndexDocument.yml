@@ -1,0 +1,55 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: >
+  A Lambda@Edge function that rewrites a CloudFront origin request for a 
+  directory to a request for its index document.
+
+Parameters:
+
+  IndexDocument:
+    Type: String
+    Description: The index document for the directories in a CloudFront distribution's origin
+    AllowedPattern: ^[a-zA-Z0-9-_.]+$
+    ConstraintDescription: Valid file name
+
+Conditions:
+
+  IsEdgeRegion: !Equals [!Ref "AWS::Region", us-east-1] # Lambda@Edge functions must be provisioned in us-east-1
+
+Resources:
+
+  ExecutionRole:
+    # Assumed by the Lambda@Edge function
+    Type: AWS::IAM::Role
+    Condition: IsEdgeRegion
+    Properties:
+      Path: /service-role/
+      AssumeRolePolicyDocument: # Resource based policy
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: # Trust AWS Lambda and Lambda@Edge to assume this role
+              - lambda.amazonaws.com
+              - edgelambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      ManagedPolicyArns: # Attached permission policies from AWS
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  Function:
+    # Rewrites an origin request for a directory
+    Type: AWS::Lambda::Function
+    Condition: IsEdgeRegion
+    Properties:
+      Role: !GetAtt ExecutionRole.Arn
+      Description: Rewrites a CloudFront origin request for a directory to a request for its index document.
+      Runtime: python3.7
+      Handler: index.handler
+      Code:
+        ZipFile: !Sub |
+          def handler(event, context):
+              request = event["Records"][0]["cf"]["request"]
+              if request["uri"].endswith('/'):
+                  request["uri"] = request["uri"] + "${IndexDocument}"
+              return request
