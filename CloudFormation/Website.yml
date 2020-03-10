@@ -138,7 +138,7 @@ Resources:
     Properties:
       UserName: !Sub ${AWS::StackName}-ContentDeploymentUser
       Policies:
-        - PolicyName: Default
+        - PolicyName: S3
           PolicyDocument:
             Version: 2012-10-17
             Statement:
@@ -150,6 +150,15 @@ Resources:
                 Resource:
                   - !GetAtt ContentBucket.Arn
                   - !Sub ${ContentBucket.Arn}/*
+        - PolicyName: CloudFront
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource:
+                  - !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${ContentCDN}
 
   OriginAccessIdentity:
     # Requests the static assets of the website
